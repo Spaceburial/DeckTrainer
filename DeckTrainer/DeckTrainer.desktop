@@ -1,0 +1,8 @@
+[Desktop Entry]
+Type=Application
+Name=DeckTrainer
+Comment=通用游戏修改器：任意游戏的内存搜索/修改/锁定
+Exec=bash -c 'cd "$(dirname "%k")" && bash "./start.sh"'
+Icon=applications-games
+Terminal=true
+Categories=Game;Utility;
