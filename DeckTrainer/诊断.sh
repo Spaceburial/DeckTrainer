@@ -34,8 +34,12 @@ else
 fi
 
 say ""
-say "== ptrace 限制 =="
+say "== ptrace 限制（后台自动识别模式需要 0；启动选项模式不需要） =="
 run cat /proc/sys/kernel/yama/ptrace_scope
+
+say ""
+say "== 后台自动识别进程 =="
+run bash -c "pgrep -af 'DeckTrainer --hub|trainer.py --hub' || echo '未运行后台模式'"
 
 say ""
 say "== 端口 =="
@@ -48,7 +52,8 @@ run bash -c "ps -e -o pid,user,rss,comm,args --sort=-rss | grep -iE '\.exe|wine|
 
 say ""
 say "== 最近运行日志 =="
-run bash -c "tail -40 '$HERE/运行日志.txt'"
+run bash -c "tail -40 '$HERE/运行日志.txt' 2>/dev/null"
+run bash -c "tail -20 '$HERE/后台日志.txt' 2>/dev/null"
 
 say ""
 say "== Steam 启动选项（含 DeckTrainer 的行） =="

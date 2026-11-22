@@ -86,6 +86,115 @@ GAMES = [
      ]},
 ]
 
+# 同一游戏可能的多个可执行文件名（Proton 下常见 shipping/exe 变体）
+EXE_ALIASES = {
+    "pbz": ["pbz.exe", "pbz-win64-shipping.exe", "pbz-win64-test.exe"],
+    "rottr": ["riseofthetombraider.exe"],
+    "outerwilds": ["outerwilds.exe"],
+    "cp2077": ["cyberpunk2077.exe"],
+}
+
+GENERIC_VALUES = [
+    {"label": "金钱 / 货币", "type": "int32", "how": "看游戏里的数字 → 全类型搜索 → 花掉/获得后『精确值』再搜"},
+    {"label": "生命 / 血量", "type": "float", "how": "血条无数字：模糊快照 → 受伤后『减少』→ 再受伤 → 『减少』"},
+    {"label": "弹药 / 数量", "type": "int32", "how": "看弹匣/背包数量 → 精确搜索 → 使用后『减少』"},
+    {"label": "经验 / 技能点", "type": "int32", "how": "看点数 → 精确搜索 → 升级/加点后『减少』"},
+]
+
+NON_GAME_EXES = {
+    "steam.exe", "steamwebhelper.exe", "steamerrorreporter.exe", "gameoverlayui.exe",
+    "explorer.exe", "services.exe", "svchost.exe", "conhost.exe", "cmd.exe",
+    "powershell.exe", "rundll32.exe", "wineboot.exe", "winedevice.exe",
+    "crashpad_handler.exe", "easyanticheat.exe", "eac_launcher.exe",
+    "epicgameslauncher.exe", "battle.net.exe", "chrome.exe", "msedge.exe", "firefox.exe",
+    "code.exe", "discord.exe", "obs64.exe", "python.exe", "python3.exe",
+}
+
+
+def game_for_exe(exe_name):
+    low = (exe_name or "").lower()
+    for g in GAMES:
+        if low in EXE_ALIASES.get(g["key"], [g["exe"].lower()]):
+            return g
+    return None
+
+
+def detect_engine(pid, exe_name=""):
+    """从进程模块/命令行推断引擎，用于给通用游戏套用搜索策略。"""
+    names = []
+    try:
+        with open(f"/proc/{pid}/maps") as f:
+            for line in f:
+                if "/" not in line:
+                    continue
+                path = line.rstrip("\n").split(maxsplit=5)[-1].lower()
+                names.append(path)
+    except OSError:
+        pass
+    joined = " ".join(names)
+    exe_low = (exe_name or "").lower()
+    if " unityplayer.dll" in joined or "/unityplayer.dll" in joined or "gameassembly.dll" in joined:
+        if "mono-2.0-bdwgc.dll" in joined or "mono.dll" in joined:
+            return "Unity (Mono)"
+        if "gameassembly.dll" in joined:
+            return "Unity (IL2CPP)"
+        return "Unity"
+    if "libmono.so" in joined and "unity" in joined:
+        return "Unity"
+    if exe_low.endswith("-win64-shipping.exe") or "unrealengine" in joined or "/engine/binaries/" in joined:
+        return "Unreal Engine"
+    if "red4engine" in joined or exe_low == "cyberpunk2077.exe":
+        return "REDengine"
+    if "godot" in joined or exe_low.startswith("godot"):
+        return "Godot"
+    if "engine.dll" in joined and "client.dll" in joined:
+        return "Source"
+    if "libvulkan" in joined or "d3d11.dll" in joined or "dxgi.dll" in joined:
+        return "未知（D3D/Vulkan 游戏）"
+    return "未知（通用模式）"
+
+
+def identify_process(pid, proc=None):
+    """识别进程对应的游戏、引擎、位数、可选属性预设。"""
+    procs = {p["pid"]: p for p in list_processes()}
+    p = proc or procs.get(pid) or {}
+    exe = p.get("exe", "")
+    game = game_for_exe(exe)
+    appid = ""
+    try:
+        with open(f"/proc/{pid}/environ", "rb") as f:
+            for kv in f.read().split(b"\0"):
+                if kv.startswith(b"SteamAppId=") or kv.startswith(b"SteamGameId="):
+                    appid = kv.split(b"=", 1)[1].decode("utf-8", "replace").strip()
+                    break
+    except OSError:
+        pass
+    # 位数：看映射的最高地址
+    bits = 64
+    try:
+        with open(f"/proc/{pid}/maps") as f:
+            last = ""
+            for line in f:
+                last = line
+        if last:
+            bits = 64 if int(last.split("-")[1].split()[0], 16) > 0x100000000 else 32
+    except (OSError, ValueError, IndexError):
+        pass
+    return {
+        "pid": pid,
+        "exe": exe,
+        "name": game["name"] if game else (p.get("name") or exe or f"pid {pid}"),
+        "key": game["key"] if game else "",
+        "engine": detect_engine(pid, exe),
+        "bits": bits,
+        "appid": appid,
+        "kind": p.get("kind", ""),
+        "rss": p.get("rss", 0),
+        "values": (game["values"] if game else GENERIC_VALUES),
+        "tip": (game["tip"] if game else "未收录的游戏：按通用套路搜。先搜有数字显示的数值（钱/弹药），血条用模糊快照。"),
+        "matched": bool(game),
+    }
+
 
 # ---------------------------------------------------------------- 进程 / 内存
 
@@ -130,7 +239,7 @@ def list_processes():
                 kind = "wine"
             else:
                 kind = "native"
-            game = next((g for g in GAMES if g["exe"].lower() == exe_name.lower()), None)
+            game = game_for_exe(exe_name)
             procs.append({
                 "pid": pid, "exe": exe_name,
                 "name": game["name"] if game else exe_name,
@@ -571,7 +680,7 @@ STATE = {
     "vtype": "int32", "mode": "none",
     "candidates": [], "fuzzy": [], "truncated": False,
     "freezes": {}, "log": [], "busy": False, "scan_info": "",
-    "recovered": [],
+    "recovered": [], "identify": None,
 }
 FREEZE_THREAD = None
 FREEZE_STOP = threading.Event()
@@ -634,34 +743,91 @@ def do_attach(pid):
     regions = list_regions(pid)
     if not regions:
         return {"ok": False, "error": "无法读取该进程内存：确认游戏已进入场景；桌面模式需先设置密码并用 sudo 运行，或在游戏模式使用自动挂接"}
+    ident = identify_process(pid, p)
     with STATE_LOCK:
         STATE.update({"pid": pid, "game": p["name"] if p else f"pid {pid}",
                       "key": p["key"] if p else "",
+                      "identify": ident,
                       "candidates": [], "fuzzy": [], "mode": "none",
                       "freezes": {}, "truncated": False})
     start_freezer()
-    log(f"已附加 {STATE['game']} (pid {pid})，可写段 {len(regions)}")
+    log(f"已附加 {STATE['game']} (pid {pid})，引擎 {ident['engine']}，可写段 {len(regions)}")
     recovered = relocate_bookmarks(pid, STATE["game"])
     return {"ok": True, "pid": pid, "game": STATE["game"],
             "regions": len(regions), "key": STATE["key"],
-            "recovered": recovered}
+            "identify": ident, "recovered": recovered}
 
 
-def auto_attach_watcher(target_names, timeout=120):
+def is_game_candidate(p, min_rss=200 * 1024 * 1024):
+    """判断进程像不像游戏（自动识别用）。"""
+    if p.get("key"):
+        return True
+    exe = (p.get("exe") or "").lower()
+    if exe in NON_GAME_EXES:
+        return False
+    cmd = (p.get("cmd") or "").lower()
+    if "/steamapps/common/" in cmd or "/steamapps/compatdata/" in cmd:
+        return p.get("rss", 0) >= 128 * 1024 * 1024
+    if exe.endswith(".exe") and p.get("rss", 0) >= min_rss:
+        return True
+    if p.get("kind") == "native" and p.get("rss", 0) >= 512 * 1024 * 1024:
+        return not any(k in cmd for k in ("browser", "chrome", "electron", "code", "kde", "plasma"))
+    return False
+
+
+def hub_watcher(min_rss=200 * 1024 * 1024):
+    """后台模式：持续监听新启动的游戏并自动附加；游戏退出后自动待机。"""
+    last_pid = 0
+    while True:
+        try:
+            with STATE_LOCK:
+                pid = STATE["pid"]
+            if pid:
+                alive = os.path.exists(f"/proc/{pid}")
+                if not alive:
+                    with STATE_LOCK:
+                        STATE.update({"pid": 0, "game": "未附加", "key": "", "identify": None,
+                                      "candidates": [], "fuzzy": [], "freezes": {}, "mode": "none"})
+                    log("游戏已退出，自动识别继续等待下一个游戏")
+            else:
+                cands = [p for p in list_processes() if is_game_candidate(p, min_rss)]
+                if cands:
+                    best = max(cands, key=lambda x: (bool(x.get("key")), x.get("rss", 0)))
+                    if best["pid"] != last_pid:
+                        r = do_attach(best["pid"])
+                        if r.get("ok"):
+                            log(f"自动识别并附加：{r['game']} (pid {best['pid']})")
+                            last_pid = best["pid"]
+                        else:
+                            log(f"自动附加失败：{r.get('error')}")
+        except Exception as e:
+            log(f"自动识别异常：{type(e).__name__}: {e}")
+        time.sleep(2)
+
+
+def auto_attach_watcher(target_names, timeout=180):
     """启动模式下等待游戏进程出现并自动附加（无需用户操作）。"""
     targets = {t.lower() for t in target_names if t}
+    if not targets:
+        hub_watcher()
+        return
     end = time.time() + timeout
     while time.time() < end:
         procs = list_processes()
         cands = [p for p in procs if p["exe"].lower() in targets and p["rss"] > 64 * 1024 * 1024]
+        if not cands:
+            # 进程名对不上（Proton 版本差异）时，用通用识别兜底
+            cands = [p for p in procs if is_game_candidate(p, 128 * 1024 * 1024)]
         if cands:
-            pid = max(cands, key=lambda x: x["rss"])["pid"]
-            r = do_attach(pid)
+            best = max(cands, key=lambda x: (bool(x.get("key")), x.get("rss", 0)))
+            r = do_attach(best["pid"])
             if r.get("ok"):
-                log(f"自动附加成功：{r['game']} (pid {pid})")
+                log(f"自动附加成功：{r['game']} (pid {best['pid']})")
+                hub_watcher()
                 return
         time.sleep(1)
-    log("自动附加超时：没找到游戏进程。若界面里也看不到，请在桌面模式运行 诊断.sh 查看报告")
+    log("自动附加超时：没找到游戏进程；继续按通用识别等待")
+    hub_watcher()
 
 
 # ---------------------------------------------------------------- 网页界面
@@ -711,6 +877,13 @@ td button{padding:4px 6px;font-size:12px}
     <button class="pri" onclick="attach()">附加</button>
   </div>
   <div class="status" style="margin-top:6px" id="attachInfo">未附加。Steam/Proton/Wine/原生 Linux 游戏都能在这里选。</div>
+</div>
+
+<div class="card hidden" id="idCard">
+  <h2>🧠 自动识别 <span class="status" id="idTitle"></span></h2>
+  <div class="tip" id="idMeta"></div>
+  <div class="row" id="idAttrs" style="margin-top:6px"></div>
+  <div class="tip" id="idTip" style="margin-top:6px"></div>
 </div>
 
 <div class="card">
@@ -769,7 +942,7 @@ td button{padding:4px 6px;font-size:12px}
 
 <script>
 const $=id=>document.getElementById(id);
-let PROCS=[];
+let PROCS=[], LAST_KEY=null;
 const TYPES=[["int32","4字节整数"],["uint32","4字节无符号"],["int64","8字节整数"],["uint64","8字节无符号"],["float","单精度小数"],["double","双精度小数"]];
 TYPES.forEach(([v,l])=>{const o=document.createElement('option');o.value=v;o.textContent=l;$('vtype').appendChild(o);});
 
@@ -839,7 +1012,20 @@ async function lockRecovered(addr,type,val){ const d=await api('/api/freeze',{ad
 
 async function refresh(){
   const d=await api('/api/state');
-  $('stat').textContent = d.pid? `● ${d.game}` : '未附加';
+  $('stat').textContent = d.pid? `● ${d.game}` : '未附加（自动识别中）';
+  const id=d.identify;
+  if(id && d.pid){
+    $('idCard').classList.remove('hidden');
+    $('idTitle').textContent = id.name + (id.matched?'（已收录）':'（通用配方）');
+    $('idMeta').textContent = `引擎 ${id.engine} · ${id.bits} 位 · ${(id.rss/1048576).toFixed(0)}MB` + (id.appid?` · AppID ${id.appid}`:'') + ` · pid ${id.pid}`;
+    $('idAttrs').innerHTML = id.values.map(v=>`<button onclick="pickAttr('${v.type}','${v.label}')">${v.label} <span class="status">${shortType(v.type)}</span></button>`).join('');
+    $('idTip').textContent = id.tip;
+    $('attachInfo').textContent = `已附加：${d.game} (pid ${d.pid})${id.matched?'，已识别游戏':'，未收录但可通用修改'}`;
+  } else {
+    $('idCard').classList.add('hidden');
+    $('attachInfo').textContent = '未附加。启动游戏后会自动识别；也可在上方手动选择进程。';
+  }
+  if(d.key!==LAST_KEY){ LAST_KEY=d.key; loadRecipe(d.key); }
   $('cnt').textContent = d.count? `候选 ${d.count} 个` : '';
   const tb=$('rows');
   if(!d.rows.length){ tb.innerHTML='<tr><td colspan="6" class="tip">无结果</td></tr>'; }
@@ -874,6 +1060,12 @@ function loadRecipe(key){
     $('recipe').innerHTML=`<div class="tip"><b>${d.recipe.name}</b>：${d.recipe.tip}</div>
       <table style="margin-top:6px">${d.recipe.values.map(v=>`<tr><td>${v.label}</td><td class="status">${v.type.toUpperCase()}</td><td class="tip">${v.how}</td></tr>`).join('')}</table>`;
   });
+}
+function pickAttr(type,label){
+  $('vtype').value=type;
+  $('value').placeholder='输入'+label+'的当前数值';
+  $('value').scrollIntoView({block:'center'});
+  $('value').focus();
 }
 loadProcs(); refresh(); setInterval(refresh,1200);
 </script>
@@ -930,9 +1122,10 @@ class Handler(BaseHTTPRequestHandler):
             game = STATE["game"]
             mode = STATE["mode"]
             recovered = STATE.get("recovered", [])
+            identify = STATE.get("identify")
         self._send({"pid": pid, "game": game, "count": count, "rows": rows,
                     "freezes": freezes, "log": log_tail, "mode": mode,
-                    "recovered": recovered,
+                    "recovered": recovered, "identify": identify,
                     "bookmarks": load_bookmarks()[-30:]})
 
     def do_POST(self):
@@ -1245,10 +1438,11 @@ def selftest(pid, value, vtype="int32"):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--version", action="version", version="DeckTrainer v2.1")
+    ap.add_argument("--version", action="version", version="DeckTrainer v2.2")
     ap.add_argument("--port", type=int, default=PORT_DEFAULT)
     ap.add_argument("--lan", action="store_true", help="允许局域网访问（手机控制用）")
     ap.add_argument("--launch", nargs=argparse.REMAINDER, help="先启动游戏命令再提供服务")
+    ap.add_argument("--hub", action="store_true", help="后台自动识别模式（不启动游戏）")
     ap.add_argument("--selftest", nargs=2, metavar=("PID", "VALUE"))
     args = ap.parse_args()
 
@@ -1257,31 +1451,58 @@ def main():
         selftest(int(args.selftest[0]), v)
         return
 
+    # 关键：先把游戏拉起来，再做任何可能失败的初始化。
+    # 之前先绑定端口再启动游戏，端口被占用时进程直接退出，表现为“加了启动选项游戏打不开”。
+    proc = None
+    targets = []
+    if args.launch:
+        launch = [a for a in args.launch if a != "--"]
+        if launch:
+            print("启动游戏:", " ".join(launch), flush=True)
+            try:
+                proc = subprocess.Popen(launch)
+            except Exception as e:
+                log(f"启动游戏失败：{type(e).__name__}: {e}")
+                print(f"[X] 启动游戏失败：{e}", flush=True)
+                sys.exit(1)
+            targets = [os.path.basename(t.replace("\\", "/")) for t in launch
+                       if t.lower().endswith(".exe")]
+
     host = "0.0.0.0" if args.lan else "127.0.0.1"
-    server = ThreadingHTTPServer((host, args.port), Handler)
-    urls = [f"http://127.0.0.1:{args.port}"]
+    server = None
+    port = args.port
+    for cand in [args.port] + [args.port + i for i in range(1, 6)] + [0]:
+        try:
+            server = ThreadingHTTPServer((host, cand), Handler)
+            port = server.server_address[1]
+            break
+        except OSError as e:
+            log(f"端口 {cand} 绑定失败：{e}")
+            server = None
+    if server is None:
+        log("所有端口都绑定失败，界面不可用（游戏仍会正常运行）")
+        if proc is not None:
+            proc.wait()
+        sys.exit(1)
+
+    urls = [f"http://127.0.0.1:{port}"]
     if args.lan:
-        urls += [f"http://{ip}:{args.port}" for ip in lan_ips()]
+        urls += [f"http://{ip}:{port}" for ip in lan_ips()]
     print("=" * 52)
-    print(" DeckTrainer v2.1 已启动，浏览器打开以下地址：")
+    print(f" DeckTrainer v2.2 已启动（端口 {port}），浏览器打开：")
     for u in urls:
         print("   " + u)
-    if args.launch:
-        print(" 手机与 Deck 连同一个 Wi-Fi 时用上面 192.168.x.x 的地址")
+    if args.lan:
+        print(" 手机与 Deck 连同一个 Wi-Fi 时用 192.168.x.x 的地址")
     print("=" * 52, flush=True)
     try:
-        with open(os.path.join(os.path.dirname(os.path.abspath(__file__)), "last_url.txt"), "w") as f:
+        base = os.path.dirname(os.path.abspath(sys.executable if getattr(sys, "frozen", False) else __file__))
+        with open(os.path.join(base, "last_url.txt"), "w") as f:
             f.write("\n".join(urls) + "\n")
     except OSError:
         pass
 
-    proc = None
-    if args.launch:
-        launch = [a for a in args.launch if a != "--"]
-        print("启动游戏:", " ".join(launch), flush=True)
-        proc = subprocess.Popen(launch)
-        targets = [os.path.basename(t.replace("\\", "/")) for t in launch
-                   if t.lower().endswith(".exe")]
+    if args.launch and proc is not None:
         threading.Thread(target=auto_attach_watcher, args=(targets,), daemon=True).start()
 
         def wait_game():
@@ -1291,6 +1512,10 @@ def main():
             os.kill(os.getpid(), 15)
 
         threading.Thread(target=wait_game, daemon=True).start()
+    else:
+        # 后台/桌面模式：自动识别并附加任何新启动的游戏
+        threading.Thread(target=hub_watcher, daemon=True).start()
+        log("自动识别已开启：启动游戏后会自动附加，无需手动选择进程")
 
     try:
         server.serve_forever()
