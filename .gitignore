@@ -2,3 +2,9 @@ __pycache__/
 *.pyc
 last_url.txt
 *.zip
+dist/
+build/
+*.spec
+DeckTrainer/DeckTrainer
+DeckTrainer/运行日志.txt
+DeckTrainer/诊断报告.txt

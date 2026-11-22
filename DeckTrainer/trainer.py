@@ -32,6 +32,8 @@ from array import array
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse, parse_qs
 
+BASE_DIR = os.path.dirname(os.path.abspath(sys.argv[0]))
+RUN_LOG = os.path.join(BASE_DIR, "运行日志.txt")
 PORT_DEFAULT = 8766
 CHUNK = 8 * 1024 * 1024
 OVERLAP = 8
@@ -99,15 +101,20 @@ def list_processes():
                 cmd = [c for c in f.read().split(b"\0") if c]
             if not cmd:
                 continue
-            exe_path = cmd[0].decode("utf-8", "replace")
-            name = os.path.basename(exe_path.rstrip("/")) or f"pid {pid}"
-            try:
-                real = os.readlink(f"/proc/{pid}/exe")
-                if real and not real.startswith("/"):
-                    real = exe_path
-                name = os.path.basename(real) or name
-            except OSError:
-                pass
+            tokens = [t.decode("utf-8", "replace") for t in cmd]
+            # Proton/Wine 游戏的真实名字藏在参数里的 *.exe，优先取最后一个
+            exe_name = ""
+            for tok in reversed(tokens):
+                base = os.path.basename(tok.replace("\\", "/").rstrip("/"))
+                if base.lower().endswith(".exe"):
+                    exe_name = base
+                    break
+            if not exe_name:
+                try:
+                    real = os.readlink(f"/proc/{pid}/exe")
+                    exe_name = os.path.basename(real)
+                except OSError:
+                    exe_name = os.path.basename(tokens[0].rstrip("/")) or f"pid {pid}"
             rss = 0
             with open(f"/proc/{pid}/status") as f:
                 for line in f:
@@ -116,23 +123,33 @@ def list_processes():
                         break
             if rss < 8 * 1024 * 1024:
                 continue
-            if "/steamapps/" in exe_path:
+            cmdline = " ".join(tokens)
+            if "/steamapps/" in cmdline:
                 kind = "steam"
-            elif name.lower().endswith(".exe"):
+            elif exe_name.lower().endswith(".exe"):
                 kind = "wine"
             else:
                 kind = "native"
-            game = next((g for g in GAMES if g["exe"].lower() == name.lower()), None)
+            game = next((g for g in GAMES if g["exe"].lower() == exe_name.lower()), None)
             procs.append({
-                "pid": pid, "exe": name,
-                "name": game["name"] if game else name,
+                "pid": pid, "exe": exe_name,
+                "name": game["name"] if game else exe_name,
                 "key": game["key"] if game else "",
-                "kind": kind, "rss": rss,
+                "kind": kind, "rss": rss, "cmd": cmdline[:200],
             })
         except (OSError, ValueError):
             continue
+    # 同名同 exe 的进程只保留内存占用最大的一个（Wine 会派生多个同名子进程）
+    best = {}
+    for p in procs:
+        k = p["exe"].lower()
+        if k not in best or p["rss"] > best[k]["rss"]:
+            best[k] = p
+    procs = list(best.values())
     order = {"steam": 0, "wine": 1, "native": 2}
-    procs.sort(key=lambda p: (-int(bool(p["key"])), order[p["kind"]], -p["rss"]))
+    procs.sort(key=lambda p: (-int(bool(p["key"])) if p["kind"] != "native" else 99,
+                              order[p["kind"]], -p["rss"]))
+    procs.sort(key=lambda p: (not bool(p["key"])))
     return procs
 
 
@@ -562,10 +579,16 @@ FREEZE_STOP = threading.Event()
 
 def log(msg):
     ts = time.strftime("%H:%M:%S")
+    line = f"[{ts}] {msg}"
     with STATE_LOCK:
-        STATE["log"].append(f"[{ts}] {msg}")
+        STATE["log"].append(line)
         STATE["log"] = STATE["log"][-80:]
-    print(msg, flush=True)
+    print(line, flush=True)
+    try:
+        with open(RUN_LOG, "a", encoding="utf-8") as f:
+            f.write(line + "\n")
+    except OSError:
+        pass
 
 
 def freeze_loop():
@@ -602,6 +625,43 @@ def cell_type_for(addr):
             if c["addr"] == addr:
                 return c["type"]
         return STATE["vtype"]
+
+
+def do_attach(pid):
+    """附加指定进程并初始化会话（HTTP 与自动附加共用）。"""
+    procs = {p["pid"]: p for p in list_processes()}
+    p = procs.get(pid)
+    regions = list_regions(pid)
+    if not regions:
+        return {"ok": False, "error": "无法读取该进程内存：确认游戏已进入场景；桌面模式需先设置密码并用 sudo 运行，或在游戏模式使用自动挂接"}
+    with STATE_LOCK:
+        STATE.update({"pid": pid, "game": p["name"] if p else f"pid {pid}",
+                      "key": p["key"] if p else "",
+                      "candidates": [], "fuzzy": [], "mode": "none",
+                      "freezes": {}, "truncated": False})
+    start_freezer()
+    log(f"已附加 {STATE['game']} (pid {pid})，可写段 {len(regions)}")
+    recovered = relocate_bookmarks(pid, STATE["game"])
+    return {"ok": True, "pid": pid, "game": STATE["game"],
+            "regions": len(regions), "key": STATE["key"],
+            "recovered": recovered}
+
+
+def auto_attach_watcher(target_names, timeout=120):
+    """启动模式下等待游戏进程出现并自动附加（无需用户操作）。"""
+    targets = {t.lower() for t in target_names if t}
+    end = time.time() + timeout
+    while time.time() < end:
+        procs = list_processes()
+        cands = [p for p in procs if p["exe"].lower() in targets and p["rss"] > 64 * 1024 * 1024]
+        if cands:
+            pid = max(cands, key=lambda x: x["rss"])["pid"]
+            r = do_attach(pid)
+            if r.get("ok"):
+                log(f"自动附加成功：{r['game']} (pid {pid})")
+                return
+        time.sleep(1)
+    log("自动附加超时：没找到游戏进程。若界面里也看不到，请在桌面模式运行 诊断.sh 查看报告")
 
 
 # ---------------------------------------------------------------- 网页界面
@@ -902,23 +962,8 @@ class Handler(BaseHTTPRequestHandler):
             self._send({"ok": False, "error": f"{type(e).__name__}: {e}"})
 
     def _attach(self, pid):
-        procs = {p["pid"]: p for p in list_processes()}
-        p = procs.get(pid)
-        regions = list_regions(pid)
-        if not regions:
-            self._send({"ok": False, "error": "无法读取该进程内存：确认游戏已进入场景，或桌面模式请用 start.sh（sudo）运行"})
-            return
-        with STATE_LOCK:
-            STATE.update({"pid": pid, "game": p["name"] if p else f"pid {pid}",
-                          "key": p["key"] if p else "",
-                          "candidates": [], "fuzzy": [], "mode": "none",
-                          "freezes": {}, "truncated": False})
-        start_freezer()
-        log(f"已附加 {STATE['game']} (pid {pid})，可写段 {len(regions)}")
-        recovered = relocate_bookmarks(pid, STATE["game"])
-        self._send({"ok": True, "pid": pid, "game": STATE["game"],
-                    "regions": len(regions), "key": STATE["key"],
-                    "recovered": recovered})
+        r = do_attach(pid)
+        self._send(r)
 
     def _scan(self, data):
         with STATE_LOCK:
@@ -1200,6 +1245,7 @@ def selftest(pid, value, vtype="int32"):
 
 def main():
     ap = argparse.ArgumentParser()
+    ap.add_argument("--version", action="version", version="DeckTrainer v2.1")
     ap.add_argument("--port", type=int, default=PORT_DEFAULT)
     ap.add_argument("--lan", action="store_true", help="允许局域网访问（手机控制用）")
     ap.add_argument("--launch", nargs=argparse.REMAINDER, help="先启动游戏命令再提供服务")
@@ -1217,7 +1263,7 @@ def main():
     if args.lan:
         urls += [f"http://{ip}:{args.port}" for ip in lan_ips()]
     print("=" * 52)
-    print(" DeckTrainer v2 已启动，浏览器打开以下地址：")
+    print(" DeckTrainer v2.1 已启动，浏览器打开以下地址：")
     for u in urls:
         print("   " + u)
     if args.launch:
@@ -1234,6 +1280,9 @@ def main():
         launch = [a for a in args.launch if a != "--"]
         print("启动游戏:", " ".join(launch), flush=True)
         proc = subprocess.Popen(launch)
+        targets = [os.path.basename(t.replace("\\", "/")) for t in launch
+                   if t.lower().endswith(".exe")]
+        threading.Thread(target=auto_attach_watcher, args=(targets,), daemon=True).start()
 
         def wait_game():
             proc.wait()
