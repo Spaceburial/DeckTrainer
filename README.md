@@ -23,7 +23,8 @@
 
 ## 安装
 
-1. 下载本仓库，把 `DeckTrainer/` 整个文件夹放到 `/home/deck/DeckTrainer/`。
+1. 从 [Releases](https://github.com/Spaceburial/DeckTrainer/releases/latest) 下载 `DeckTrainer-v2.zip`，解压得到 `DeckTrainer/` 文件夹，放到 `/home/deck/DeckTrainer/`。
+   （或直接克隆本仓库，使用仓库内的 `DeckTrainer/` 目录。）
 2. 右键 `DeckTrainer.desktop` → 属性 → 允许作为程序执行。
 
 ## 使用
